@@ -152,9 +152,8 @@ end
 ourNamecall = function(self, ...)
 	local m = safeMethod()
 	if m == "FireServer" then
-		local args = {...}
-		local a = args[1]
-		if a == "damage" then
+		local ok, a = pcall(function() return (...) end)
+		if ok and a == "damage" then
 			local now = os.clock()
 			if now - (ourNamecall._last or 0) < 0.045 + math.random() * 0.03 then
 				return nil
