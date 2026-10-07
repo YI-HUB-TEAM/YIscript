@@ -1,0 +1,210 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+
+local KEYS = {
+	Core = "r7bx0jmd",
+	Character = "c8k2ptw9",
+	AntiCheat = "a5nq3vze",
+}
+
+local band, bxor, bnot, rrotate, rshift = bit32.band, bit32.bxor, bit32.bnot, bit32.rrotate, bit32.rshift
+
+local K = {
+	1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221,
+	3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580,
+	3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+	2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+	666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037,
+	2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+	430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+	1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298,
+}
+
+local function sha256(msg)
+	local len = #msg
+	local data = msg .. "\128" .. string.rep("\000", (55 - len) % 64) .. string.pack(">I8", len * 8)
+	local w = table.create(64, 0)
+	local n = #data
+	local h0, h1, h2, h3, h4, h5, h6, h7 = 1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225
+	for i = 1, n, 64 do
+		for j = 1, 16 do w[j] = string.unpack(">I4", data, i + (j - 1) * 4) end
+		for j = 17, 64 do
+			local a, b = w[j - 15], w[j - 2]
+			local s0 = bxor(rrotate(a, 7), rrotate(a, 18), rshift(a, 3))
+			local s1 = bxor(rrotate(b, 17), rrotate(b, 19), rshift(b, 10))
+			w[j] = (w[j - 16] + s0 + w[j - 7] + s1) % 4294967296
+		end
+		local a, b, c, d, e, f, g, h = h0, h1, h2, h3, h4, h5, h6, h7
+		for j = 1, 64 do
+			local S1 = bxor(rrotate(e, 6), rrotate(e, 11), rrotate(e, 25))
+			local ch = bxor(band(e, f), band(bnot(e), g))
+			local t1 = (h + S1 + ch + K[j] + w[j]) % 4294967296
+			local S0 = bxor(rrotate(a, 2), rrotate(a, 13), rrotate(a, 22))
+			local maj = bxor(band(a, b), band(a, c), band(b, c))
+			local t2 = (S0 + maj) % 4294967296
+			h, g, f, e, d, c, b, a = g, f, e, (d + t1) % 4294967296, c, b, a, (t1 + t2) % 4294967296
+		end
+		h0, h1, h2, h3 = (h0 + a) % 4294967296, (h1 + b) % 4294967296, (h2 + c) % 4294967296, (h3 + d) % 4294967296
+		h4, h5, h6, h7 = (h4 + e) % 4294967296, (h5 + f) % 4294967296, (h6 + g) % 4294967296, (h7 + h) % 4294967296
+	end
+	return string.format("%08x%08x%08x%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4, h5, h6, h7)
+end
+
+local function ratchet_new(s) return { index = 0, state = sha256("init|" .. s) } end
+local function ratchet_advance(r) r.state = sha256("step|" .. r.state) r.index = r.index + 1 end
+
+local function ratchet_catchup(r, target, budget)
+	budget = budget or 8
+	local n = 0
+	while r.index < target do
+		if n >= budget then return false end
+		ratchet_advance(r)
+		n = n + 1
+	end
+	return r.index == target
+end
+
+local function ratchet_respond(r, nonce)
+	return sha256("resp|" .. r.state .. "|" .. r.index .. "|" .. nonce)
+end
+
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local HS = Modules:WaitForChild("HandshakeSystem")
+local RE = HS:WaitForChild("RemoteEvent")
+
+local chains, last, seed = {}, {}, nil
+
+RE.OnClientEvent:Connect(function(kind, a, b, c)
+	if kind == "s" and type(a) == "string" then
+		seed = a
+		return
+	end
+	if kind == "c" then
+		local channel, index, nonce = a, b, c
+		local key = KEYS[channel]
+		if not key then return end
+		if not seed or type(index) ~= "number" or type(nonce) ~= "string" then return end
+		if last[channel] == index then return end
+		local chain = chains[channel]
+		if not chain then
+			chain = ratchet_new(sha256("ac1|" .. seed .. "|" .. key .. "|" .. channel))
+			chains[channel] = chain
+		end
+		if ratchet_catchup(chain, index) then
+			last[channel] = index
+			pcall(function() RE:FireServer("r", channel, index, ratchet_respond(chain, nonce)) end)
+		end
+	end
+end)
+
+local function killAntiCheat()
+	local ac = ReplicatedFirst:FindFirstChild("AntiCheat")
+	if not ac then return end
+	pcall(function() ac.Enabled = false end)
+	pcall(function() ReplicatedStorage.Remote.PlayerEvent:FireServer("loadAreaContent", "Disabled") end)
+	pcall(function() ac:Destroy() end)
+end
+
+local function sentinel()
+	pcall(function()
+		ReplicatedFirst.DescendantAdded:Connect(function(inst)
+			local ok, name = pcall(function() return inst.Name end)
+			if ok and name == "AntiCheat" then
+				task.defer(killAntiCheat)
+			end
+		end)
+	end)
+end
+
+local function scrubGlobals()
+	local env
+	pcall(function() env = getgenv and getgenv() or _G end)
+	if not env then return end
+	local leaks = {
+		"getgc", "getreg", "getrenv", "getrawmetatable", "setreadonly",
+		"getscriptbytecode", "getstringhash", "identifyexecutor", "getexecutorname",
+		"setupvalue", "isexecutorclosure", "checkclosure", "restorefunction",
+		"replaceclosure", "newcclosure", "firesignal", "getconnections",
+		"getloadedmodules", "syn", "KRNL_LOADED", "is_sirhurt_closure",
+		"secure_load", "electron",
+		"IY_LOADED", "IY_DEBUG", "IY", "InfiniteYield", "INFINITE_YIELD",
+		"globalcontainer", "globalenv", "saveinstance", "SaveInstance",
+		"Cobalt", "cobalt", "umf", "UMF", "streamBuffer", "StreamBuffer",
+		"script_key", "EXECUTOR_NAME", "PYHUB", "pyhub", "PYHUB_LOADED",
+		"Mikkado", "secular", "Secular",
+	}
+	for _, k in ipairs(leaks) do
+		pcall(function() env[k] = nil end)
+		pcall(function() _G[k] = nil end)
+	end
+end
+
+local installed = false
+local origNamecall = nil
+local ourNamecall
+
+local function safeMethod()
+	local ok, m = pcall(getnamecallmethod)
+	if ok then return m end
+	return nil
+end
+
+ourNamecall = function(self, ...)
+	local m = safeMethod()
+	if m == "FireServer" then
+		local args = {...}
+		local a = args[1]
+		if a == "damage" then
+			local now = os.clock()
+			if now - (ourNamecall._last or 0) < 0.045 + math.random() * 0.03 then
+				return nil
+			end
+			ourNamecall._last = now
+		end
+	end
+	if type(origNamecall) == "function" then
+		return origNamecall(self, ...)
+	end
+end
+
+local function installNamecall()
+	if installed then return end
+	if not hookmetamethod then return end
+	local ok = pcall(function()
+		origNamecall = hookmetamethod(game, "__namecall", ourNamecall)
+	end)
+	if ok and type(origNamecall) == "function" then
+		installed = true
+	end
+end
+
+scrubGlobals()
+killAntiCheat()
+sentinel()
+
+task.spawn(function()
+	pcall(function()
+		if not game:IsLoaded() then game.Loaded:Wait() end
+	end)
+	task.wait(1)
+	installNamecall()
+end)
+
+task.spawn(function()
+	while true do
+		pcall(function() RE:FireServer("h") end)
+		task.wait(2)
+	end
+end)
+
+task.spawn(function()
+	local n = 0
+	while task.wait(1) do
+		n = n + 1
+		pcall(scrubGlobals)
+		if n % 5 == 0 then
+			local ac = ReplicatedFirst:FindFirstChild("AntiCheat")
+			if ac then pcall(function() ac:Destroy() end) end
+		end
+	end
+end)
